@@ -2,9 +2,11 @@ package logstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/maxpert/marmot/stream"
 	"time"
+
+	"github.com/maxpert/marmot/stream"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/maxpert/marmot/cfg"
@@ -16,23 +18,29 @@ import (
 const maxReplicateRetries = 7
 const SnapshotShardID = uint64(1)
 
+var SnapshotLeaseTTL = 10 * time.Second
+
 type Replicator struct {
 	nodeID             uint64
 	shards             uint64
 	compressionEnabled bool
+	lastSnapshot       time.Time
 
 	client    *nats.Conn
 	repState  *replicationState
+	metaStore *replicatorMetaStore
 	snapshot  snapshot.NatsSnapshot
 	streamMap map[uint64]nats.JetStreamContext
 }
 
 func NewReplicator(
-	nodeID uint64,
-	shards uint64,
-	compress bool,
 	snapshot snapshot.NatsSnapshot,
 ) (*Replicator, error) {
+	nodeID := cfg.Config.NodeID
+	shards := cfg.Config.ReplicationLog.Shards
+	compress := cfg.Config.ReplicationLog.Compress
+	updateExisting := cfg.Config.ReplicationLog.UpdateExisting
+
 	nc, err := stream.Connect()
 	if err != nil {
 		return nil, err
@@ -46,7 +54,7 @@ func NewReplicator(
 			return nil, err
 		}
 
-		streamCfg := makeShardConfig(shard, shards, compress)
+		streamCfg := makeShardStreamConfig(shard, shards, compress)
 		info, err := js.StreamInfo(streamName(shard, compress), nats.MaxWait(10*time.Second))
 		if err == nats.ErrStreamNotFound {
 			log.Debug().Uint64("shard", shard).Msg("Creating stream")
@@ -54,8 +62,23 @@ func NewReplicator(
 		}
 
 		if err != nil {
-			log.Error().Err(err).Str("name", streamName(shard, compress)).Msg("Unable to get stream info...")
+			log.Error().
+				Err(err).
+				Str("name", streamName(shard, compress)).
+				Msg("Unable to get stream info...")
 			return nil, err
+		}
+
+		if updateExisting && !eqShardStreamConfig(&info.Config, streamCfg) {
+			log.Warn().Msgf("Stream configuration not same for %s, updating...", streamName(shard, compress))
+			info, err = js.UpdateStream(streamCfg)
+			if err != nil {
+				log.Error().
+					Err(err).
+					Str("name", streamName(shard, compress)).
+					Msg("Unable update stream info...")
+				return nil, err
+			}
 		}
 
 		leader := ""
@@ -83,15 +106,22 @@ func NewReplicator(
 		return nil, err
 	}
 
+	metaStore, err := newReplicatorMetaStore(cfg.EmbeddedClusterName, nc)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Replicator{
 		client:             nc,
 		nodeID:             nodeID,
 		compressionEnabled: compress,
+		lastSnapshot:       time.Time{},
 
 		shards:    shards,
 		streamMap: streamMap,
 		snapshot:  snapshot,
 		repState:  repState,
+		metaStore: metaStore,
 	}, nil
 }
 
@@ -149,8 +179,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	savedSeq := r.repState.get(streamName(shardID, r.compressionEnabled))
 	for sub.IsValid() {
 		msg, err := sub.NextMsg(5 * time.Second)
-
-		if err == nats.ErrTimeout {
+		if errors.Is(err, nats.ErrTimeout) {
 			continue
 		}
 
@@ -170,7 +199,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		err = r.invokeListener(callback, msg)
 		if err != nil {
 			msg.Nak()
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				return nil
 			}
 
@@ -213,7 +242,29 @@ func (r *Replicator) RestoreSnapshot() error {
 	return nil
 }
 
+func (r *Replicator) LastSaveSnapshotTime() time.Time {
+	return r.lastSnapshot
+}
+
 func (r *Replicator) SaveSnapshot() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	locked, err := r.metaStore.ContextRefreshingLease("snapshot", SnapshotLeaseTTL, ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Error acquiring snapshot lock")
+		return
+	}
+
+	if !locked {
+		log.Info().Msg("Snapshot saving already locked, skipping")
+		return
+	}
+
+	r.ForceSaveSnapshot()
+}
+
+func (r *Replicator) ForceSaveSnapshot() {
 	if r.snapshot == nil {
 		return
 	}
@@ -223,7 +274,28 @@ func (r *Replicator) SaveSnapshot() {
 		log.Error().
 			Err(err).
 			Msg("Unable snapshot database")
+		return
 	}
+
+	r.lastSnapshot = time.Now()
+}
+
+func (r *Replicator) ReloadCertificates() error {
+	if cfg.Config.NATS.CAFile != "" {
+		err := nats.RootCAs(cfg.Config.NATS.CAFile)(&r.client.Opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cfg.Config.NATS.CertFile != "" && cfg.Config.NATS.KeyFile != "" {
+		err := nats.ClientCert(cfg.Config.NATS.CertFile, cfg.Config.NATS.KeyFile)(&r.client.Opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
@@ -264,7 +336,7 @@ func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *na
 	return err
 }
 
-func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
+func makeShardStreamConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
 	streamName := streamName(shardID, compressed)
 	replicas := cfg.Config.ReplicationLog.Replicas
 	if replicas < 1 {
@@ -289,6 +361,23 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		DenyDelete:        true,
 		Replicas:          replicas,
 	}
+}
+
+func eqShardStreamConfig(a *nats.StreamConfig, b *nats.StreamConfig) bool {
+	return a.Name == b.Name &&
+		len(a.Subjects) == 1 &&
+		len(b.Subjects) == 1 &&
+		a.Subjects[0] == b.Subjects[0] &&
+		a.Discard == b.Discard &&
+		a.MaxMsgs == b.MaxMsgs &&
+		a.Storage == b.Storage &&
+		a.Retention == b.Retention &&
+		a.AllowDirect == b.AllowDirect &&
+		a.MaxConsumers == b.MaxConsumers &&
+		a.MaxMsgsPerSubject == b.MaxMsgsPerSubject &&
+		a.Duplicates == b.Duplicates &&
+		a.DenyDelete == b.DenyDelete &&
+		a.Replicas == b.Replicas
 }
 
 func streamName(shardID uint64, compressed bool) string {

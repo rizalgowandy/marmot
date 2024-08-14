@@ -1,11 +1,13 @@
 package snapshot
 
 import (
+	"os"
+	"time"
+
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/stream"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
-	"os"
 )
 
 const hashHeaderKey = "marmot-snapshot-tag"
@@ -49,8 +51,8 @@ func (n *natsStorage) Upload(name, filePath string) error {
 	log.Info().
 		Str("hash", hash).
 		Str("file_name", name).
-		Uint64("size", info.Size).
 		Str("file_path", filePath).
+		Uint64("size", info.Size).
 		Uint32("chunks", info.Chunks).
 		Msg("Snapshot saved to NATS")
 
@@ -63,16 +65,34 @@ func (n *natsStorage) Download(filePath, name string) error {
 		return err
 	}
 
-	err = blb.GetFile(name, filePath)
-	if err == nats.ErrObjectNotFound {
-		return ErrNoSnapshotFound
-	}
+	for {
+		err = blb.GetFile(name, filePath)
+		if err == nil {
+			return nil
+		}
 
-	return err
+		if err == nats.ErrObjectNotFound {
+			return ErrNoSnapshotFound
+		}
+
+		if jsmErr, ok := err.(nats.JetStreamError); ok {
+			log.Warn().
+				Err(err).
+				Int("Status", jsmErr.APIError().Code).
+				Msg("Error downloading snapshot")
+
+			if jsmErr.APIError().Code == 503 {
+				time.Sleep(time.Second)
+				continue
+			}
+		}
+
+		return err
+	}
 }
 
 func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
-	js, err := conn.JetStream()
+	js, err := conn.JetStream(nats.MaxWait(30 * time.Second))
 	if err != nil {
 		return nil, err
 	}

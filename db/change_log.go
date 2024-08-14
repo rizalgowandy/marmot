@@ -6,12 +6,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/maxpert/marmot/cfg"
-	"github.com/maxpert/marmot/utils"
 	"regexp"
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/utils"
 
 	_ "embed"
 
@@ -23,10 +24,15 @@ import (
 
 var ErrNoTableMapping = errors.New("no table mapping found")
 var ErrLogNotReadyToPublish = errors.New("not ready to publish changes")
+var ErrEndOfWatch = errors.New("watching event finished")
 
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
+
+//go:embed global_change_log_script.tmpl
+var globalChangeLogScriptTemplate string
 var tableChangeLogTpl *template.Template
+var globalChangeLogTpl *template.Template
 
 var spaceStripper = regexp.MustCompile(`\n\s+`)
 
@@ -39,6 +45,10 @@ const (
 )
 const changeLogName = "change_log"
 const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
+
+type globalChangeLogTemplateData struct {
+	Prefix string
+}
 
 type triggerTemplateData struct {
 	Prefix    string
@@ -62,6 +72,10 @@ type changeLogEntry struct {
 func init() {
 	tableChangeLogTpl = template.Must(
 		template.New("tableChangeLogScriptTemplate").Parse(tableChangeLogScriptTemplate),
+	)
+
+	globalChangeLogTpl = template.Must(
+		template.New("globalChangeLogScriptTemplate").Parse(globalChangeLogScriptTemplate),
 	)
 }
 
@@ -112,6 +126,19 @@ func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
 
 func (conn *SqliteStreamDB) globalMetaTable() string {
 	return conn.prefix + "_change_log_global"
+}
+
+func (conn *SqliteStreamDB) globalCDCScript() (string, error) {
+	buf := new(bytes.Buffer)
+	err := globalChangeLogTpl.Execute(buf, &globalChangeLogTemplateData{
+		Prefix: conn.prefix,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return spaceStripper.ReplaceAllString(buf.String(), "\n    "), nil
 }
 
 func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) {
@@ -178,6 +205,27 @@ func (conn *SqliteStreamDB) getPrimaryKeyMap(event *ChangeLogEvent) map[string]a
 	return ret
 }
 
+func (conn *SqliteStreamDB) initGlobalChangeLog() error {
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return err
+	}
+	defer sqlConn.Return()
+
+	script, err := conn.globalCDCScript()
+	if err != nil {
+		return err
+	}
+
+	log.Info().Msg("Creating global change log table")
+	_, err = sqlConn.DB().Exec(script)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (conn *SqliteStreamDB) initTriggers(tableName string) error {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
@@ -205,6 +253,24 @@ func (conn *SqliteStreamDB) initTriggers(tableName string) error {
 	return nil
 }
 
+func (conn *SqliteStreamDB) filterChangesTo(changed chan fsnotify.Event, watcher *fsnotify.Watcher) {
+	for {
+		select {
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				close(changed)
+				return
+			}
+
+			if ev.Op == fsnotify.Chmod {
+				continue
+			}
+
+			changed <- ev
+		}
+	}
+}
+
 func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string) {
 	shmPath := path + "-shm"
 	walPath := path + "-wal"
@@ -212,25 +278,40 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	errDB := watcher.Add(path)
 	errShm := watcher.Add(shmPath)
 	errWal := watcher.Add(walPath)
+	dbChanged := make(chan fsnotify.Event)
 
 	tickerDur := time.Duration(cfg.Config.PollingInterval) * time.Millisecond
 	changeLogTicker := utils.NewTimeoutPublisher(tickerDur)
 
 	// Publish change logs for any residual change logs before starting watcher
 	conn.publishChangeLog()
+	go conn.filterChangesTo(dbChanged, watcher)
 
 	for {
-		select {
-		case ev, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
+		changeLogTicker.Reset()
 
-			if ev.Op != fsnotify.Chmod {
+		err := conn.WithReadTx(func(_tx *sql.Tx) error {
+			select {
+			case ev, ok := <-dbChanged:
+				if !ok {
+					return ErrEndOfWatch
+				}
+
+				log.Debug().Int("change", int(ev.Op)).Msg("Change detected")
+				conn.publishChangeLog()
+			case <-changeLogTicker.Channel():
+				log.Debug().Dur("timeout", tickerDur).Msg("Change polling timeout")
 				conn.publishChangeLog()
 			}
-		case <-changeLogTicker.Channel():
-			conn.publishChangeLog()
+
+			return nil
+		})
+
+		if err != nil {
+			log.Warn().Err(err).Msg("Error watching changes; trying to resubscribe...")
+			errDB = watcher.Add(path)
+			errShm = watcher.Add(shmPath)
+			errWal = watcher.Add(walPath)
 		}
 
 		if errDB != nil {
@@ -244,14 +325,12 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 		if errWal != nil {
 			errWal = watcher.Add(walPath)
 		}
-
-		changeLogTicker.Reset()
 	}
 }
 
 func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEntry, error) {
 	sw := utils.NewStopWatch("scan_changes")
-	defer sw.Log(log.Debug())
+	defer sw.Log(log.Debug(), conn.stats.scanChanges)
 
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
@@ -272,12 +351,39 @@ func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEnt
 	return entries, nil
 }
 
+func (conn *SqliteStreamDB) countChanges() (int64, error) {
+	sw := utils.NewStopWatch("count_changes")
+	defer sw.Log(log.Debug(), conn.stats.countChanges)
+
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return -1, err
+	}
+	defer sqlConn.Return()
+
+	return sqlConn.DB().
+		From(conn.globalMetaTable()).
+		Count()
+}
+
 func (conn *SqliteStreamDB) publishChangeLog() {
 	if !conn.publishLock.TryLock() {
 		log.Warn().Msg("Publish in progress skipping...")
 		return
 	}
 	defer conn.publishLock.Unlock()
+
+	cnt, err := conn.countChanges()
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to count global changes")
+		return
+	}
+
+	conn.stats.pendingPublish.Set(float64(cnt))
+	if cnt <= 0 {
+		log.Debug().Msg("no new rows")
+		return
+	}
 
 	changes, err := conn.getGlobalChanges(cfg.Config.ScanMaxChanges)
 	if err != nil {
@@ -309,21 +415,23 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 
 		err = conn.consumeChangeLogs(change.TableName, []*changeLogEntry{&logEntry})
 		if err != nil {
-			if err == ErrLogNotReadyToPublish || err == context.Canceled {
+			if errors.Is(err, ErrLogNotReadyToPublish) || errors.Is(err, context.Canceled) {
 				break
 			}
 
 			log.Error().Err(err).Msg("Unable to consume changes")
 		}
 
-		err = conn.cleanupChangeLog(change)
+		err = conn.markChangePublished(change)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to cleanup change log")
 		}
+
+		conn.stats.published.Inc()
 	}
 }
 
-func (conn *SqliteStreamDB) cleanupChangeLog(change globalChangeLogEntry) error {
+func (conn *SqliteStreamDB) markChangePublished(change globalChangeLogEntry) error {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
 		return err

@@ -5,15 +5,23 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/maxpert/marmot/cfg"
-	"github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
-var embeddedServer *server.Server = nil
-var embeddedLock = &sync.Mutex{}
+type embeddedNats struct {
+	server *server.Server
+	lock   *sync.Mutex
+}
+
+var embeddedIns = &embeddedNats{
+	server: nil,
+	lock:   &sync.Mutex{},
+}
 
 func parseHostAndPort(adr string) (string, int, error) {
 	host, portStr, err := net.SplitHostPort(adr)
@@ -29,38 +37,50 @@ func parseHostAndPort(adr string) (string, int, error) {
 	return host, port, nil
 }
 
-func startEmbeddedServer(nodeName string) (*server.Server, error) {
-	embeddedLock.Lock()
-	defer embeddedLock.Unlock()
+func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
+	embeddedIns.lock.Lock()
+	defer embeddedIns.lock.Unlock()
 
-	if embeddedServer != nil {
-		return embeddedServer, nil
+	if embeddedIns.server != nil {
+		return embeddedIns, nil
+	}
+
+	host, port, err := parseHostAndPort(cfg.Config.NATS.BindAddress)
+	if err != nil {
+		return nil, err
 	}
 
 	opts := &server.Options{
 		ServerName:         nodeName,
-		Host:               "127.0.0.1",
-		Port:               -1,
+		Host:               host,
+		Port:               port,
 		NoSigs:             true,
 		JetStream:          true,
-		StoreDir:           path.Join(cfg.TmpDir, "nats", nodeName),
-		JetStreamMaxMemory: 1 << 25,
-		JetStreamMaxStore:  1 << 30,
-		Routes:             server.RoutesFromStr(*cfg.ClusterPeers),
+		JetStreamMaxMemory: -1,
+		JetStreamMaxStore:  -1,
 		Cluster: server.ClusterOpts{
-			Name: "e-marmot",
+			Name: cfg.EmbeddedClusterName,
 		},
+		LeafNode: server.LeafNodeOpts{},
 	}
 
-	if *cfg.ClusterListenAddr != "" {
-		host, port, err := parseHostAndPort(*cfg.ClusterListenAddr)
+	if *cfg.ClusterPeersFlag != "" {
+		opts.Routes = server.RoutesFromStr(*cfg.ClusterPeersFlag)
+	}
+
+	if *cfg.ClusterAddrFlag != "" {
+		host, port, err := parseHostAndPort(*cfg.ClusterAddrFlag)
 		if err != nil {
 			return nil, err
 		}
 
-		opts.Cluster.ListenStr = *cfg.ClusterListenAddr
+		opts.Cluster.ListenStr = *cfg.ClusterAddrFlag
 		opts.Cluster.Host = host
 		opts.Cluster.Port = port
+	}
+
+	if *cfg.LeafServerFlag != "" {
+		opts.LeafNode.Remotes = parseRemoteLeafOpts()
 	}
 
 	if cfg.Config.NATS.ServerConfigFile != "" {
@@ -70,16 +90,61 @@ func startEmbeddedServer(nodeName string) (*server.Server, error) {
 		}
 	}
 
+	originalRoutes := opts.Routes
+	if len(opts.Routes) != 0 {
+		opts.Routes = flattenRoutes(originalRoutes, true)
+	}
+
+	if opts.StoreDir == "" {
+		opts.StoreDir = path.Join(cfg.DataRootDir, "nats", nodeName)
+	}
+
 	s, err := server.NewServer(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	s.SetLogger(logger.NewStdLogger(true, false, false, true, false), true, false)
+	s.SetLogger(
+		&natsLogger{log.With().Str("from", "nats").Logger()},
+		opts.Debug,
+		opts.Trace,
+	)
 	s.Start()
-	log.Info().
-		Bool("clustered", s.JetStreamIsClustered()).
-		Msg("Started embedded JetStream server...")
-	embeddedServer = s
-	return s, nil
+
+	embeddedIns.server = s
+	return embeddedIns, nil
+}
+
+func (e *embeddedNats) prepareConnection(opts ...nats.Option) (*nats.Conn, error) {
+	e.lock.Lock()
+	s := e.server
+	e.lock.Unlock()
+
+	for !s.ReadyForConnections(1 * time.Second) {
+		continue
+	}
+
+	opts = append(opts, nats.InProcessServer(s))
+	for {
+		c, err := nats.Connect("", opts...)
+		if err != nil {
+			log.Warn().Err(err).Msg("NATS server not accepting connections...")
+			continue
+		}
+
+		j, err := c.JetStream()
+		if err != nil {
+			return nil, err
+		}
+
+		st, err := j.StreamInfo("marmot-r", nats.MaxWait(1*time.Second))
+		if err == nats.ErrStreamNotFound || st != nil {
+			log.Info().Msg("Streaming ready...")
+			return c, nil
+		}
+
+		c.Close()
+		log.Debug().Err(err).Msg("Streams not ready, waiting for NATS streams to come up...")
+		time.Sleep(1 * time.Second)
+	}
 }

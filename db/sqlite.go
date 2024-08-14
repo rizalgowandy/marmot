@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/pool"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -19,6 +22,13 @@ const snapshotTransactionMode = "exclusive"
 
 var PoolSize = 4
 var MarmotPrefix = "__marmot__"
+
+type statsSqliteStreamDB struct {
+	published      telemetry.Counter
+	pendingPublish telemetry.Gauge
+	countChanges   telemetry.Histogram
+	scanChanges    telemetry.Histogram
+}
 
 type SqliteStreamDB struct {
 	OnChange      func(event *ChangeLogEvent) error
@@ -29,14 +39,16 @@ type SqliteStreamDB struct {
 	dbPath            string
 	prefix            string
 	watchTablesSchema map[string][]*ColumnInfo
+	stats             *statsSqliteStreamDB
 }
 
 type ColumnInfo struct {
-	Name         string `db:"name"`
-	Type         string `db:"type"`
-	NotNull      bool   `db:"notnull"`
-	DefaultValue any    `db:"dflt_value"`
-	IsPrimaryKey bool   `db:"pk"`
+	Name            string `db:"name"`
+	Type            string `db:"type"`
+	NotNull         bool   `db:"notnull"`
+	DefaultValue    any    `db:"dflt_value"`
+	PrimaryKeyIndex int    `db:"pk"`
+	IsPrimaryKey    bool
 }
 
 func RestoreFrom(destPath, bkFilePath string) error {
@@ -139,6 +151,12 @@ func OpenStreamDB(path string) (*SqliteStreamDB, error) {
 		prefix:            MarmotPrefix,
 		publishLock:       &sync.Mutex{},
 		watchTablesSchema: map[string][]*ColumnInfo{},
+		stats: &statsSqliteStreamDB{
+			published:      telemetry.NewCounter("published", "number of rows published"),
+			pendingPublish: telemetry.NewGauge("pending_publish", "rows pending publishing"),
+			countChanges:   telemetry.NewHistogram("count_changes", "latency counting changes in microseconds"),
+			scanChanges:    telemetry.NewHistogram("scan_changes", "latency scanning change rows in DB"),
+		},
 	}
 
 	return ret, nil
@@ -181,16 +199,6 @@ func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) installChangeLogTriggers() error {
-	for tableName := range conn.watchTablesSchema {
-		err := conn.initTriggers(tableName)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (conn *SqliteStreamDB) RemoveCDC(tables bool) error {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
@@ -208,6 +216,20 @@ func (conn *SqliteStreamDB) RemoveCDC(tables bool) error {
 		return removeMarmotTables(sqlConn.DB(), conn.prefix)
 	}
 
+	return nil
+}
+
+func (conn *SqliteStreamDB) installChangeLogTriggers() error {
+	if err := conn.initGlobalChangeLog(); err != nil {
+		return err
+	}
+
+	for tableName := range conn.watchTablesSchema {
+		err := conn.initTriggers(tableName)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -231,10 +253,12 @@ func getTableInfo(tx *goqu.TxDatabase, table string) ([]*ColumnInfo, error) {
 		}
 
 		c := ColumnInfo{}
-		err = rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.IsPrimaryKey)
+		err = rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.PrimaryKeyIndex)
 		if err != nil {
 			return nil, err
 		}
+
+		c.IsPrimaryKey = c.PrimaryKeyIndex > 0
 
 		if c.IsPrimaryKey {
 			hasPrimaryKey = true
@@ -311,6 +335,34 @@ func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
 
 func (conn *SqliteStreamDB) GetPath() string {
 	return conn.dbPath
+}
+
+func (conn *SqliteStreamDB) WithReadTx(cb func(tx *sql.Tx) error) error {
+	var tx *sql.Tx = nil
+	db, _, err := pool.OpenRaw(fmt.Sprintf("%s?_journal_mode=WAL", conn.dbPath))
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Any("recover", r).Msg("Recovered read transaction")
+		}
+
+		if tx != nil {
+			err = tx.Rollback()
+			if err != nil {
+				log.Error().Err(err).Msg("Error performing read transaction")
+			}
+		}
+
+		db.Close()
+		cancel()
+	}()
+
+	tx, err = db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return cb(tx)
 }
 
 func copyFile(toPath, fromPath string) error {
